@@ -65,3 +65,10 @@ dockers:
       - "--label=org.opencontainers.image.version={{.Version}}"
       - "--label=org.opencontainers.image.source={{.GitURL}}"
     use: buildx
+    extra_files:
+      - go.mod
+      - go.sum
+      - internal/
+      - opds/
+      - main.go
+      - main_test.go
