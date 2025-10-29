@@ -49,6 +49,8 @@ type OPDS struct {
 	HideCalibreFiles bool
 	HideDotFiles     bool
 	NoCache          bool
+	GroupFormats     bool
+	AuthorFromFolder bool
 }
 
 type IsDirer interface {
@@ -128,6 +130,74 @@ func (s OPDS) Handler(w http.ResponseWriter, req *http.Request) error {
 	return nil
 }
 
+// bookFormat represents a single format of a book
+type bookFormat struct {
+	filename  string
+	extension string
+}
+
+// extractBaseName removes known ebook extensions from filename
+func extractBaseName(filename string) string {
+	name := filename
+
+	// Handle compound extensions like .kepub.epub, .advanced.epub
+	for {
+		ext := filepath.Ext(name)
+		if ext == "" {
+			break
+		}
+		name = strings.TrimSuffix(name, ext)
+	}
+
+	return name
+}
+
+// groupFilesByBaseName groups files that share the same base name
+func groupFilesByBaseName(entries []os.DirEntry, hideCalibreFiles, hideDotFiles bool) map[string][]bookFormat {
+	groups := make(map[string][]bookFormat)
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		filename := entry.Name()
+
+		if fileShouldBeIgnored(filename, hideCalibreFiles, hideDotFiles) {
+			continue
+		}
+
+		ext := filepath.Ext(filename)
+
+		baseName := extractBaseName(filename)
+		groups[baseName] = append(groups[baseName], bookFormat{
+			filename:  filename,
+			extension: ext,
+		})
+	}
+
+	return groups
+}
+
+// extractAuthorFromPath extracts the author name from the parent folder
+func extractAuthorFromPath(fpath string, trustedRoot string) string {
+	parentPath := filepath.Dir(fpath)
+
+	// Don't use the root directory as author
+	if parentPath == trustedRoot || parentPath == "." || parentPath == "/" {
+		return ""
+	}
+
+	author := filepath.Base(parentPath)
+
+	// Don't use generic folder names as authors
+	if author == "." || author == "/" {
+		return ""
+	}
+
+	return author
+}
+
 func (s OPDS) makeFeed(fpath string, req *http.Request) atom.Feed {
 	feedBuilder := opds.FeedBuilder.
 		ID(req.URL.Path).
@@ -136,26 +206,101 @@ func (s OPDS) makeFeed(fpath string, req *http.Request) atom.Feed {
 		AddLink(opds.LinkBuilder.Rel("start").Href("/").Type(navigationType).Build())
 
 	dirEntries, _ := os.ReadDir(fpath)
-	for _, entry := range dirEntries {
 
+	var entries []atom.Entry
+	if s.GroupFormats {
+		entries = buildGroupedFeed(fpath, dirEntries, req, s)
+	} else {
+		entries = buildStandardFeed(fpath, dirEntries, req, s)
+	}
+
+	for _, e := range entries {
+		feedBuilder = feedBuilder.AddEntry(e)
+	}
+
+	return feedBuilder.Build()
+}
+
+// mkLink constructs an opds.Link for a given filename and path type
+func mkLink(name string, pathType int, req *http.Request) atom.Link {
+	return opds.LinkBuilder.
+		Rel(getRel(name, pathType)).
+		Title(name).
+		Href(filepath.Join(req.URL.RequestURI(), url.PathEscape(name))).
+		Type(getType(name, pathType)).
+		Build()
+}
+
+// buildEntry builds an atom.Entry from id, title, links and optional author
+func buildEntry(id, title string, links []atom.Link, author string) atom.Entry {
+	eb := opds.EntryBuilder.ID(id).Title(title)
+	if author != "" {
+		eb = eb.Author(&atom.Person{Name: author})
+	}
+	for _, l := range links {
+		eb = eb.AddLink(l)
+	}
+	return eb.Build()
+}
+
+// buildGroupedFeed encapsulates the grouped branch of makeFeed
+func buildGroupedFeed(fpath string, dirEntries []os.DirEntry, req *http.Request, s OPDS) []atom.Entry {
+	groups := groupFilesByBaseName(dirEntries, s.HideCalibreFiles, s.HideDotFiles)
+
+	var author string
+	if s.AuthorFromFolder {
+		author = extractAuthorFromPath(fpath, s.TrustedRoot)
+	}
+
+	var entries []atom.Entry
+
+	for baseName, formats := range groups {
+		// Determine type using first format
+		firstPath := filepath.Join(fpath, formats[0].filename)
+		pathType := getPathType(firstPath)
+
+		// If it's a directory, keep original behavior (single link to subsection)
+		if pathType == pathTypeDirOfDirs || pathType == pathTypeDirOfFiles {
+			l := mkLink(formats[0].filename, pathType, req)
+			e := buildEntry(req.URL.Path+formats[0].filename, formats[0].filename, []atom.Link{l}, "")
+			entries = append(entries, e)
+			continue
+		}
+
+		// For files, build entry with multiple acquisition links
+		var links []atom.Link
+		for _, format := range formats {
+			links = append(links, mkLink(format.filename, pathTypeFile, req))
+		}
+
+		e := buildEntry(req.URL.Path+baseName, baseName, links, author)
+		entries = append(entries, e)
+	}
+
+	return entries
+}
+
+// buildStandardFeed encapsulates the original non-grouped branch of makeFeed
+func buildStandardFeed(fpath string, dirEntries []os.DirEntry, req *http.Request, s OPDS) []atom.Entry {
+	var entries []atom.Entry
+	for _, entry := range dirEntries {
 		if fileShouldBeIgnored(entry.Name(), s.HideCalibreFiles, s.HideDotFiles) {
 			continue
 		}
 
 		pathType := getPathType(filepath.Join(fpath, entry.Name()))
-		feedBuilder = feedBuilder.
-			AddEntry(opds.EntryBuilder.
-				ID(req.URL.Path + entry.Name()).
-				Title(entry.Name()).
-				AddLink(opds.LinkBuilder.
-					Rel(getRel(entry.Name(), pathType)).
-					Title(entry.Name()).
-					Href(filepath.Join(req.URL.RequestURI(), url.PathEscape(entry.Name()))).
-					Type(getType(entry.Name(), pathType)).
-					Build()).
-				Build())
+		l := mkLink(entry.Name(), pathType, req)
+
+		author := ""
+		if s.AuthorFromFolder && pathType == pathTypeFile {
+			author = extractAuthorFromPath(fpath, s.TrustedRoot)
+		}
+
+		e := buildEntry(req.URL.Path+entry.Name(), entry.Name(), []atom.Link{l}, author)
+		entries = append(entries, e)
 	}
-	return feedBuilder.Build()
+
+	return entries
 }
 
 func fileShouldBeIgnored(filename string, hideCalibreFiles, hideDotFiles bool) bool {

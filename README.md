@@ -42,7 +42,51 @@ Usage of dir2opds:
         adds reponse headers to avoid client from caching.
   -port string
         The server will listen in this port. (default "8080")
+  -group-formats
+        Group multiple files with the same base name into a single entry.
+  -author-from-folder
+        Extract author name from parent folder.
 ```
+
+### Recommended Setup for Organized Libraries
+
+If your books are organized with a folder structure like:
+
+```
+Books/
+├── Author Name/           ← Author folders (contain only folders)
+│   ├── Book Title 1/      ← Book folders (contain only files)
+│   │   ├── book.epub
+│   │   ├── book.mobi
+│   │   └── book.azw3
+│   └── Book Title 2/
+│       └── book.epub
+└── Another Author/
+    └── Another Book/
+```
+
+Use these flags for the best experience:
+
+```bash
+dir2opds -dir ~/Books -group-formats -author-from-folder
+```
+
+**Benefits:**
+- `-group-formats`: Combines all files with the same base name into a single OPDS entry with multiple download links
+- `-author-from-folder`: Extracts author name from the parent folder and adds it to the OPDS metadata
+
+**Example OPDS output:**
+```xml
+<entry>
+    <title>Hunger</title>
+    <author><name>Knut Hamsun</name></author>
+    <link rel="..." href=".../Hunger.epub" type="application/epub+zip"/>
+    <link rel="..." href=".../Hunger.mobi" type="application/x-mobipocket-ebook"/>
+    <link rel="..." href=".../Hunger.azw3" type="application/vnd.amazon.mobi8-ebook"/>
+</entry>
+```
+
+Instead of 3 separate entries, you get one clean entry with all formats available.
 
 ## Tested on
 
