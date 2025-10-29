@@ -179,6 +179,41 @@ func groupFilesByBaseName(entries []os.DirEntry, hideCalibreFiles, hideDotFiles 
 	return groups
 }
 
+// dirEntryWithName is a small adapter that implements os.DirEntry for synthetic entries
+type dirEntryWithName struct {
+	dir  string
+	name string
+}
+
+func (d dirEntryWithName) Name() string               { return d.dir + "/" + d.name }
+func (d dirEntryWithName) IsDir() bool                { return false }
+func (d dirEntryWithName) Type() os.FileMode          { return 0 }
+func (d dirEntryWithName) Info() (os.FileInfo, error) { return nil, nil }
+
+// convertDirEntries converts a slice of os.DirEntry-like objects into a []os.DirEntry
+// We already created dirEntryWithName which implements os.DirEntry, so no-op.
+func convertDirEntries(entries []os.DirEntry) []os.DirEntry { return entries }
+
+// authorHasBookSubdirs detects if current folder contains subdirectories that contain files
+func authorHasBookSubdirs(fpath string, dirEntries []os.DirEntry, s OPDS) bool {
+	for _, de := range dirEntries {
+		if !de.IsDir() {
+			continue
+		}
+		subPath := filepath.Join(fpath, de.Name())
+		subEntries, err := os.ReadDir(subPath)
+		if err != nil {
+			continue
+		}
+		for _, se := range subEntries {
+			if !se.IsDir() && !fileShouldBeIgnored(se.Name(), s.HideCalibreFiles, s.HideDotFiles) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // extractAuthorFromPath extracts the author name from the parent folder
 func extractAuthorFromPath(fpath string, trustedRoot string) string {
 	parentPath := filepath.Dir(fpath)
@@ -223,10 +258,29 @@ func (s OPDS) makeFeed(fpath string, req *http.Request) atom.Feed {
 
 // mkLink constructs an opds.Link for a given filename and path type
 func mkLink(name string, pathType int, req *http.Request) atom.Link {
+	// Build href preserving path separators but escaping each path segment.
+	// This allows names like "Author/Book/file.ext" to map to proper nested URLs.
+	href := ""
+	if strings.Contains(name, string(filepath.Separator)) || strings.Contains(name, "/") {
+		// Normalize to forward slash for URLs
+		parts := strings.Split(name, "/")
+		// also handle OS-specific separator just in case
+		if len(parts) == 1 {
+			parts = strings.Split(name, string(filepath.Separator))
+		}
+		for i := range parts {
+			parts[i] = url.PathEscape(parts[i])
+		}
+		base := strings.TrimSuffix(req.URL.RequestURI(), "/")
+		href = base + "/" + strings.Join(parts, "/")
+	} else {
+		href = filepath.Join(req.URL.RequestURI(), url.PathEscape(name))
+	}
+
 	return opds.LinkBuilder.
 		Rel(getRel(name, pathType)).
 		Title(name).
-		Href(filepath.Join(req.URL.RequestURI(), url.PathEscape(name))).
+		Href(href).
 		Type(getType(name, pathType)).
 		Build()
 }
@@ -245,7 +299,66 @@ func buildEntry(id, title string, links []atom.Link, author string) atom.Entry {
 
 // buildGroupedFeed encapsulates the grouped branch of makeFeed
 func buildGroupedFeed(fpath string, dirEntries []os.DirEntry, req *http.Request, s OPDS) []atom.Entry {
-	groups := groupFilesByBaseName(dirEntries, s.HideCalibreFiles, s.HideDotFiles)
+	// If AuthorFromFolder is enabled and current folder contains subdirectories that
+	// themselves contain files (author folder with book subfolders), then gather files
+	// from those subdirectories and group them, hiding the subfolders themselves.
+	var groups map[string][]bookFormat
+	if s.AuthorFromFolder {
+		// detect if dirEntries contains subdirectories with files
+		hasSubdirsWithFiles := false
+		for _, de := range dirEntries {
+			if !de.IsDir() {
+				continue
+			}
+			subPath := filepath.Join(fpath, de.Name())
+			subEntries, err := os.ReadDir(subPath)
+			if err != nil {
+				continue
+			}
+			for _, se := range subEntries {
+				if !se.IsDir() && !fileShouldBeIgnored(se.Name(), s.HideCalibreFiles, s.HideDotFiles) {
+					hasSubdirsWithFiles = true
+					break
+				}
+			}
+			if hasSubdirsWithFiles {
+				break
+			}
+		}
+
+		if hasSubdirsWithFiles {
+			// collect files from each subdirectory (book folders)
+			collected := []os.DirEntry{}
+			for _, de := range dirEntries {
+				if !de.IsDir() {
+					continue
+				}
+				subPath := filepath.Join(fpath, de.Name())
+				subEntries, err := os.ReadDir(subPath)
+				if err != nil {
+					continue
+				}
+				for _, se := range subEntries {
+					if se.IsDir() {
+						continue
+					}
+					if fileShouldBeIgnored(se.Name(), s.HideCalibreFiles, s.HideDotFiles) {
+						continue
+					}
+					// create a synthetic name that includes the subfolder so we can
+					// construct proper hrefs later (e.g., "Book/File.epub")
+					// We'll wrap into bookFormat with filename "<subdir>/<filename>".
+					collected = append(collected, dirEntryWithName{de.Name(), se.Name()})
+				}
+			}
+			// build groups from collected synthetic entries
+			groups = groupFilesByBaseName(convertDirEntries(collected), s.HideCalibreFiles, s.HideDotFiles)
+		} else {
+			groups = groupFilesByBaseName(dirEntries, s.HideCalibreFiles, s.HideDotFiles)
+		}
+	} else {
+		groups = groupFilesByBaseName(dirEntries, s.HideCalibreFiles, s.HideDotFiles)
+	}
 
 	var author string
 	if s.AuthorFromFolder {
@@ -254,20 +367,23 @@ func buildGroupedFeed(fpath string, dirEntries []os.DirEntry, req *http.Request,
 
 	var entries []atom.Entry
 
-	// First, add directory entries (keep behavior consistent with non-grouped mode)
-	for _, de := range dirEntries {
-		if !de.IsDir() {
-			continue
-		}
+	// When AuthorFromFolder with subdirs-of-files we do NOT show the book subfolders;
+	// otherwise, include directory entries as usual.
+	if !(s.AuthorFromFolder && authorHasBookSubdirs(fpath, dirEntries, s)) {
+		for _, de := range dirEntries {
+			if !de.IsDir() {
+				continue
+			}
 
-		if fileShouldBeIgnored(de.Name(), s.HideCalibreFiles, s.HideDotFiles) {
-			continue
-		}
+			if fileShouldBeIgnored(de.Name(), s.HideCalibreFiles, s.HideDotFiles) {
+				continue
+			}
 
-		pathType := getPathType(filepath.Join(fpath, de.Name()))
-		l := mkLink(de.Name(), pathType, req)
-		e := buildEntry(req.URL.Path+de.Name(), de.Name(), []atom.Link{l}, "")
-		entries = append(entries, e)
+			pathType := getPathType(filepath.Join(fpath, de.Name()))
+			l := mkLink(de.Name(), pathType, req)
+			e := buildEntry(req.URL.Path+de.Name(), de.Name(), []atom.Link{l}, "")
+			entries = append(entries, e)
+		}
 	}
 
 	for baseName, formats := range groups {
