@@ -8,7 +8,6 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"io/fs"
 	"log"
 	"mime"
 	"net/http"
@@ -137,14 +136,6 @@ type bookFormat struct {
 	extension string
 }
 
-// bookFormatRecursive includes the relative path from the current feed directory
-// so links can be built for nested files when we recurse.
-type bookFormatRecursive struct {
-	filename  string // base filename (without any path)
-	relpath   string // relative path from the feed directory to the file's dir
-	extension string
-}
-
 // extractBaseName removes known ebook extensions from filename
 func extractBaseName(filename string) string {
 	name := filename
@@ -162,7 +153,6 @@ func extractBaseName(filename string) string {
 }
 
 // groupFilesByBaseName groups files that share the same base name
-// groupFilesByBaseName groups files by their base name for the immediate directory.
 func groupFilesByBaseName(entries []os.DirEntry, hideCalibreFiles, hideDotFiles bool) map[string][]bookFormat {
 	groups := make(map[string][]bookFormat)
 
@@ -185,46 +175,6 @@ func groupFilesByBaseName(entries []os.DirEntry, hideCalibreFiles, hideDotFiles 
 			extension: ext,
 		})
 	}
-
-	return groups
-}
-
-// groupFilesByBaseNameRecursive walks the directory tree rooted at dirPath and
-// groups files found under it by their base name, keeping the relative path
-// for each file so links point to the correct nested locations.
-func groupFilesByBaseNameRecursive(dirPath string, hideCalibreFiles, hideDotFiles bool) map[string][]bookFormatRecursive {
-	groups := make(map[string][]bookFormatRecursive)
-
-	filepath.WalkDir(dirPath, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			// ignore errors visiting certain files/dirs
-			return nil
-		}
-
-		if d.IsDir() {
-			return nil
-		}
-
-		filename := d.Name()
-		if fileShouldBeIgnored(filename, hideCalibreFiles, hideDotFiles) {
-			return nil
-		}
-
-		ext := filepath.Ext(filename)
-		base := extractBaseName(filename)
-
-		// compute relative directory path from dirPath to file's directory
-		relDir := filepath.Dir(strings.TrimPrefix(path, dirPath))
-		relDir = strings.TrimPrefix(relDir, string(filepath.Separator))
-
-		groups[base] = append(groups[base], bookFormatRecursive{
-			filename:  filename,
-			relpath:   relDir,
-			extension: ext,
-		})
-
-		return nil
-	})
 
 	return groups
 }
@@ -281,33 +231,6 @@ func mkLink(name string, pathType int, req *http.Request) atom.Link {
 		Build()
 }
 
-// mkLinkForRelPath builds a link for a file that may be in a nested relative
-// path from the current feed directory. It properly escapes each path segment
-// and appends it to the request URL.
-func mkLinkForRelPath(dirRelPath, filename string, pathType int, req *http.Request) atom.Link {
-	// build href parts: requestURI + dirRelPath (if any) + filename
-	// ensure each segment is escaped
-	parts := []string{req.URL.RequestURI()}
-	if dirRelPath != "" {
-		for _, seg := range strings.Split(dirRelPath, string(filepath.Separator)) {
-			if seg == "" {
-				continue
-			}
-			parts = append(parts, url.PathEscape(seg))
-		}
-	}
-	parts = append(parts, url.PathEscape(filename))
-
-	href := strings.Join(parts, "/")
-
-	return opds.LinkBuilder.
-		Rel(getRel(filename, pathType)).
-		Title(filename).
-		Href(href).
-		Type(getType(filename, pathType)).
-		Build()
-}
-
 // buildEntry builds an atom.Entry from id, title, links and optional author
 func buildEntry(id, title string, links []atom.Link, author string) atom.Entry {
 	eb := opds.EntryBuilder.ID(id).Title(title)
@@ -322,84 +245,21 @@ func buildEntry(id, title string, links []atom.Link, author string) atom.Entry {
 
 // buildGroupedFeed encapsulates the grouped branch of makeFeed
 func buildGroupedFeed(fpath string, dirEntries []os.DirEntry, req *http.Request, s OPDS) []atom.Entry {
-	// If the current directory contains subdirectories, perform a recursive
-	// grouping across the subtree so the feed can list every book under this
-	// path in a single listing. Otherwise, group only files in the current dir.
-	hasSubdirs := false
-	for _, de := range dirEntries {
-		if de.IsDir() {
-			hasSubdirs = true
-			break
-		}
-	}
+	groups := groupFilesByBaseName(dirEntries, s.HideCalibreFiles, s.HideDotFiles)
 
-	var entries []atom.Entry
 	var author string
 	if s.AuthorFromFolder {
 		author = extractAuthorFromPath(fpath, s.TrustedRoot)
 	}
 
-	if hasSubdirs {
-		// recursive grouping
-		recGroups := groupFilesByBaseNameRecursive(fpath, s.HideCalibreFiles, s.HideDotFiles)
-
-		// include directory entries (immediate subsections)
-		for _, entry := range dirEntries {
-			if entry.IsDir() {
-				name := entry.Name()
-				if fileShouldBeIgnored(name, s.HideCalibreFiles, s.HideDotFiles) {
-					continue
-				}
-
-				pathType := getPathType(filepath.Join(fpath, name))
-				l := mkLink(name, pathType, req)
-				e := buildEntry(req.URL.Path+name, name, []atom.Link{l}, "")
-				entries = append(entries, e)
-			}
-		}
-
-		// build entries from recursive groups; note groups are by base name
-		// across the subtree so multiple formats from different subdirs will
-		// be combined if they share the same base name.
-		for baseName, formats := range recGroups {
-			var links []atom.Link
-			// choose first file's path type to detect nested directories vs files
-			for _, f := range formats {
-				// compute path type by checking actual file
-				p := filepath.Join(fpath, f.relpath, f.filename)
-				pathType := getPathType(p)
-				links = append(links, mkLinkForRelPath(f.relpath, f.filename, pathType, req))
-			}
-
-			e := buildEntry(req.URL.Path+baseName, baseName, links, author)
-			entries = append(entries, e)
-		}
-
-		return entries
-	}
-	// no subdirs: group only immediate files (existing behavior)
-	groups := groupFilesByBaseName(dirEntries, s.HideCalibreFiles, s.HideDotFiles)
-
-	// include any directory entries (should be none here) for completeness
-	for _, entry := range dirEntries {
-		if entry.IsDir() {
-			name := entry.Name()
-			if fileShouldBeIgnored(name, s.HideCalibreFiles, s.HideDotFiles) {
-				continue
-			}
-
-			pathType := getPathType(filepath.Join(fpath, name))
-			l := mkLink(name, pathType, req)
-			e := buildEntry(req.URL.Path+name, name, []atom.Link{l}, "")
-			entries = append(entries, e)
-		}
-	}
+	var entries []atom.Entry
 
 	for baseName, formats := range groups {
 		// Determine type using first format
 		firstPath := filepath.Join(fpath, formats[0].filename)
 		pathType := getPathType(firstPath)
 
+		// If it's a directory, keep original behavior (single link to subsection)
 		if pathType == pathTypeDirOfDirs || pathType == pathTypeDirOfFiles {
 			l := mkLink(formats[0].filename, pathType, req)
 			e := buildEntry(req.URL.Path+formats[0].filename, formats[0].filename, []atom.Link{l}, "")
