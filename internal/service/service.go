@@ -162,14 +162,16 @@ func groupFilesByBaseName(entries []os.DirEntry, hideCalibreFiles, hideDotFiles 
 		}
 
 		filename := entry.Name()
+		// Use the base filename (last path segment) when computing the grouping key.
+		baseFilename := filepath.Base(filename)
 
-		if fileShouldBeIgnored(filename, hideCalibreFiles, hideDotFiles) {
+		if fileShouldBeIgnored(baseFilename, hideCalibreFiles, hideDotFiles) {
 			continue
 		}
 
-		ext := filepath.Ext(filename)
+		ext := filepath.Ext(baseFilename)
 
-		baseName := extractBaseName(filename)
+		baseName := extractBaseName(baseFilename)
 		groups[baseName] = append(groups[baseName], bookFormat{
 			filename:  filename,
 			extension: ext,
@@ -279,7 +281,7 @@ func mkLink(name string, pathType int, req *http.Request) atom.Link {
 
 	return opds.LinkBuilder.
 		Rel(getRel(name, pathType)).
-		Title(name).
+		Title(filepath.Base(name)).
 		Href(href).
 		Type(getType(name, pathType)).
 		Build()
@@ -362,7 +364,13 @@ func buildGroupedFeed(fpath string, dirEntries []os.DirEntry, req *http.Request,
 
 	var author string
 	if s.AuthorFromFolder {
-		author = extractAuthorFromPath(fpath, s.TrustedRoot)
+		// If this is an author folder containing book subdirs, use the current folder
+		// name as the author so entries under the author page show the author.
+		if authorHasBookSubdirs(fpath, dirEntries, s) {
+			author = filepath.Base(fpath)
+		} else {
+			author = extractAuthorFromPath(fpath, s.TrustedRoot)
+		}
 	}
 
 	var entries []atom.Entry
