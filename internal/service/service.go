@@ -254,6 +254,22 @@ func buildGroupedFeed(fpath string, dirEntries []os.DirEntry, req *http.Request,
 
 	var entries []atom.Entry
 
+	// First, add directory entries (keep behavior consistent with non-grouped mode)
+	for _, de := range dirEntries {
+		if !de.IsDir() {
+			continue
+		}
+
+		if fileShouldBeIgnored(de.Name(), s.HideCalibreFiles, s.HideDotFiles) {
+			continue
+		}
+
+		pathType := getPathType(filepath.Join(fpath, de.Name()))
+		l := mkLink(de.Name(), pathType, req)
+		e := buildEntry(req.URL.Path+de.Name(), de.Name(), []atom.Link{l}, "")
+		entries = append(entries, e)
+	}
+
 	for baseName, formats := range groups {
 		// Determine type using first format
 		firstPath := filepath.Join(fpath, formats[0].filename)
