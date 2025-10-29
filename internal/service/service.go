@@ -391,8 +391,11 @@ func buildGroupedFeed(fpath string, dirEntries []os.DirEntry, req *http.Request,
 		firstPath := filepath.Join(fpath, formats[0].filename)
 		pathType := getPathType(firstPath)
 
-		// If it's a directory, keep original behavior (single link to subsection)
-		if pathType == pathTypeDirOfDirs || pathType == pathTypeDirOfFiles {
+		// If it's a directory, keep original behavior (single link to subsection).
+		// However, when grouping collected files from author subfolders the baseName
+		// will include a path separator (e.g. "Book/Title"). In that case treat it
+		// as a file group (acquisition entry) rather than a subsection.
+		if (pathType == pathTypeDirOfDirs || pathType == pathTypeDirOfFiles) && !strings.Contains(baseName, "/") {
 			l := mkLink(formats[0].filename, pathType, req)
 			e := buildEntry(req.URL.Path+formats[0].filename, formats[0].filename, []atom.Link{l}, "")
 			entries = append(entries, e)
